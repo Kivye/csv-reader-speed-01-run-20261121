@@ -1,6 +1,7 @@
-// csv-reader drop-in (fast): bulk slicing + clean-line fast path.
-// Written from the prose spec only: no per-character string building
-// on the hot path; indexOf/slice/split do the work.
+// csv-reader drop-in (fast) v3: single-pass scanner, cached line end,
+// no per-field array returns, no per-line slice copies.
+// Written from the prose spec only: indexOf/slice do the work;
+// strings are cut once, never built per character.
 
 export function run(input) {
   const text = String(input.text);
@@ -14,136 +15,152 @@ export function run(input) {
   let columns = null;
   let width = -1;
   let line = 1; // line number of the line starting at pos
-  let firstDone = false; // a real record has been consumed (header or first row)
+  let firstDone = false; // a real record has been consumed
 
-  const rowOf = () => (header && !firstDone ? null : rows.length);
+  let scanEnded = 1; // set by scanners: 0 = comma (record continues), 1 = record end
+  let fieldCrossed = false; // set by scanQuoted: quoted content crossed a line break
 
-  // Scan one bare (unquoted) field starting at p: up to the next comma
-  // (field ends, record continues) or LF / CRLF / EOF (record ends).
-  // A CR not followed by LF is dropped with a stray_cr error.
-  // Returns [value, nextPos, ended] with ended 0 = comma, 1 = record end.
-  function scanBare(p, startLine) {
+  // Monotonic next-occurrence caches: parse positions only move forward,
+  // so the first CR / LF at or after a watermark is found once and reused
+  // instead of rescanning the same region per field.
+  let crPos = 0;
+  let crVal = text.indexOf('\r', 0);
+  function nextCR(p) {
+    if (p < crPos || (crVal !== -1 && crVal < p)) {
+      crVal = text.indexOf('\r', p);
+      crPos = p;
+    }
+    return crVal;
+  }
+  let lfPos = 0;
+  let lfVal = text.indexOf('\n', 0);
+  function nextLF(p) {
+    if (p < lfPos || (lfVal !== -1 && lfVal < p)) {
+      lfVal = text.indexOf('\n', p);
+      lfPos = p;
+    }
+    return lfVal;
+  }
+
+  // Scan one bare (unquoted) field starting at p.
+  // lineEnd: index of the LF ending the current line, n for an EOF line,
+  // or -1 when unknown (quoted content crossed lines earlier).
+  // Sets pos + scanEnded, bumps line on record end. Returns the value.
+  function scanBare(p, startLine, rowIdx, lineEnd) {
     let parts = null;
     let start = p;
     for (;;) {
       const c = text.indexOf(',', p);
-      const lf = text.indexOf('\n', p);
-      let m = n;
-      let kind = 1; // 0 comma, 1 LF/EOF
-      if (c !== -1) { m = c; kind = 0; }
-      if (lf !== -1 && lf < m) { m = lf; kind = 1; }
-      // CR search bounded to [p, m): a CR past the field end cannot matter.
-      const crRel = text.slice(p, m).indexOf('\r');
-      if (crRel !== -1) {
-        const cr = p + crRel;
-        if (cr + 1 === m && kind === 1 && m < n) {
+      let m, kind; // kind 0 = comma, 1 = line end / EOF
+      if (lineEnd >= 0) {
+        if (c !== -1 && c < lineEnd) { m = c; kind = 0; }
+        else { m = lineEnd; kind = 1; }
+      } else {
+        const lf = nextLF(p);
+        if (c !== -1 && (lf === -1 || c < lf)) { m = c; kind = 0; }
+        else if (lf !== -1) { m = lf; kind = 1; }
+        else { m = n; kind = 1; }
+      }
+      const cr = nextCR(p);
+      if (cr !== -1 && cr < m) {
+        if (kind === 1 && cr + 1 === m && m < n) {
           // CRLF ending the record.
           const seg = text.slice(start, cr);
           line++;
-          return [parts === null ? seg : parts.join('') + seg, m + 1, 1];
+          pos = m + 1;
+          scanEnded = 1;
+          return parts === null ? seg : parts.join('') + seg;
         }
-        // stray CR: dropped, error recorded, field continues
-        errors.push({ code: 'stray_cr', line: startLine, row: rowOf() });
+        // Stray CR: dropped, error recorded, field continues.
+        errors.push({ code: 'stray_cr', line: startLine, row: rowIdx });
         if (parts === null) parts = [text.slice(start, cr)];
         else parts.push(text.slice(start, cr));
         p = cr + 1;
         start = p;
         continue;
       }
-      if (m === n) {
-        const tail = text.slice(start);
-        return [parts === null ? tail : parts.join('') + tail, n, 1];
-      }
       const seg = text.slice(start, m);
-      if (kind === 0) return [parts === null ? seg : parts.join('') + seg, m + 1, 0];
-      line++;
-      return [parts === null ? seg : parts.join('') + seg, m + 1, 1];
+      if (kind === 0) {
+        pos = m + 1;
+        scanEnded = 0;
+        return parts === null ? seg : parts.join('') + seg;
+      }
+      if (m < n) line++;
+      pos = m < n ? m + 1 : n;
+      scanEnded = 1;
+      return parts === null ? seg : parts.join('') + seg;
     }
   }
 
   // Scan one quoted field starting at p (text[p] === '"').
-  // Returns [value, nextPos, ended] with ended 0 = comma, 1 = record end.
-  function scanQuoted(p, startLine) {
+  // Sets pos + scanEnded + fieldCrossed. Returns the value.
+  function scanQuoted(p, startLine, rowIdx, lineEnd) {
     let qpos = p + 1;
-    const parts = [];
-    let lineLocal = 0; // lines passed inside quotes; committed only on close
+    let segStart = qpos;
+    let parts = null;
+    let lineLocal = 0; // breaks inside quotes; committed to line only on close
+    fieldCrossed = false;
     for (;;) {
       const q = text.indexOf('"', qpos);
       if (q === -1) {
         // Never closed: the quote is a literal, the rest is re-read bare.
-        errors.push({ code: 'unterminated_quote', line: startLine, row: rowOf() });
-        const r = scanBare(p + 1, startLine);
-        return ['"' + r[0], r[1], r[2]];
+        errors.push({ code: 'unterminated_quote', line: startLine, row: rowIdx });
+        const bare = scanBare(p + 1, startLine, rowIdx, -1);
+        return '"' + bare;
       }
-      // Any CR / LF inside the chunk [qpos, q)? Bounded to the chunk.
-      const chunk = text.slice(qpos, q);
-      const crRel = chunk.indexOf('\r');
-      const lfRel = chunk.indexOf('\n');
-      let s = -1;
-      if (crRel !== -1) s = qpos + crRel;
-      if (lfRel !== -1 && (s === -1 || qpos + lfRel < s)) s = qpos + lfRel;
-      if (s === -1) {
-        // Clean chunk: no line break before the quote.
+      // First line break inside [segStart, q), if any.
+      let brk = -1;
+      let brkIsCR = false;
+      const lfI = nextLF(segStart);
+      if (lfI !== -1 && lfI < q) brk = lfI;
+      const crI = nextCR(segStart);
+      if (crI !== -1 && crI < q && (brk === -1 || crI < brk)) { brk = crI; brkIsCR = true; }
+      if (brk === -1) {
+        // Clean chunk up to the quote at q.
         if (q + 1 < n && text.charCodeAt(q + 1) === 34) {
           // Doubled quote -> one quote in the value.
-          parts.push(text.slice(qpos, q + 1));
+          if (parts === null) parts = [text.slice(segStart, q + 1)];
+          else parts.push(text.slice(segStart, q + 1));
           qpos = q + 2;
+          segStart = qpos;
           continue;
         }
         // Closing quote.
-        parts.push(text.slice(qpos, q));
+        const tail = text.slice(segStart, q);
+        const value = parts === null ? tail : parts.join('') + tail;
         line += lineLocal;
-        qpos = q + 1;
-        break;
+        fieldCrossed = lineLocal > 0;
+        const after = q + 1;
+        if (after >= n) { pos = n; scanEnded = 1; return value; }
+        const ch = text.charCodeAt(after);
+        if (ch === 44) { pos = after + 1; scanEnded = 0; return value; }
+        if (ch === 10) { line++; pos = after + 1; scanEnded = 1; return value; }
+        if (ch === 13 && after + 1 < n && text.charCodeAt(after + 1) === 10) {
+          line++;
+          pos = after + 2;
+          scanEnded = 1;
+          return value;
+        }
+        // Anything else: junk appended as-is up to comma / line break / EOF.
+        const junk = scanBare(after, startLine, rowIdx, fieldCrossed ? -1 : lineEnd);
+        if (junk.length > 0) errors.push({ code: 'quote_junk', line: startLine, row: rowIdx });
+        return value + junk;
       }
-      // A line break sits inside the quotes: it becomes one LF in the value.
-      parts.push(text.slice(qpos, s));
-      parts.push('\n');
+      // A line break inside the quotes becomes one LF in the value.
+      if (parts === null) parts = [text.slice(segStart, brk), '\n'];
+      else { parts.push(text.slice(segStart, brk)); parts.push('\n'); }
       lineLocal++;
-      if (text.charCodeAt(s) === 13 && s + 1 < n && text.charCodeAt(s + 1) === 10) qpos = s + 2;
-      else qpos = s + 1;
-    }
-    // Closed. What follows the closing quote?
-    if (qpos >= n) return [parts.join(''), n, 1];
-    const ch = text.charCodeAt(qpos);
-    if (ch === 44) return [parts.join(''), qpos + 1, 0]; // comma
-    if (ch === 10) { line++; return [parts.join(''), qpos + 1, 1]; } // LF
-    if (ch === 13 && qpos + 1 < n && text.charCodeAt(qpos + 1) === 10) {
-      line++;
-      return [parts.join(''), qpos + 2, 1]; // CRLF
-    }
-    // Anything else: junk appended as-is up to comma / line break / EOF.
-    const r = scanBare(qpos, startLine);
-    if (r[0].length > 0) errors.push({ code: 'quote_junk', line: startLine, row: rowOf() });
-    return [parts.join('') + r[0], r[1], r[2]];
-  }
-
-  // Parse one record starting at startPos with the general scanner.
-  // Returns [fields, quotedFlags, endPos].
-  function parseGeneral(startPos, startLine) {
-    const fields = [];
-    const quoted = [];
-    let p = startPos;
-    for (;;) {
-      let r;
-      if (text.charCodeAt(p) === 34) {
-        r = scanQuoted(p, startLine);
-        quoted.push(true);
-      } else {
-        r = scanBare(p, startLine);
-        quoted.push(false);
-      }
-      fields.push(r[0]);
-      p = r[1];
-      if (r[2] === 1) return [fields, quoted, p];
+      if (brkIsCR && brk + 1 < n && text.charCodeAt(brk + 1) === 10) qpos = brk + 2;
+      else qpos = brk + 1;
+      segStart = qpos;
     }
   }
 
   // Consume one finished record: skip rule, header, width pad/cut.
-  function finishRecord(fields, quoted, startLine) {
+  function finishRecord(fields, firstQuoted, startLine) {
     // A record of exactly one empty unquoted field is not a record
-    // (a line of stray CRs only); its stray_cr errors still stand.
-    if (fields.length === 1 && fields[0] === '' && (quoted === null || !quoted[0])) return;
+    // (blank line, or a line of stray CRs only); its stray_cr errors stand.
+    if (fields.length === 1 && fields[0] === '' && !firstQuoted) return;
     if (width === -1) {
       width = fields.length;
       firstDone = true;
@@ -163,37 +180,29 @@ export function run(input) {
 
   while (pos < n) {
     const startLine = line;
-    const lf = text.indexOf('\n', pos);
-    const lineEnd = lf === -1 ? n : lf;
-    if (lineEnd === pos) { // blank line: LF at once
-      pos = lf + 1;
-      line++;
-      continue;
-    }
-    let contentEnd = lineEnd;
-    if (lf !== -1 && text.charCodeAt(lineEnd - 1) === 13) contentEnd = lineEnd - 1; // CRLF
-    if (contentEnd === pos) { // line is just "\r\n": blank line
-      pos = lf + 1;
-      line++;
-      continue;
-    }
-    // Fast path: clean line (no quote, no CR inside the content).
-    // Searches bounded to the line via a slice view.
-    const lineSeg = text.slice(pos, contentEnd);
-    if (lineSeg.indexOf('"') === -1 && lineSeg.indexOf('\r') === -1) {
-      {
-        const fields = lineSeg.split(',');
-        pos = lf === -1 ? n : lf + 1;
-        if (lf !== -1) line++;
-        finishRecord(fields, null, startLine);
-        continue;
+    const rowIdx = header && !firstDone ? null : rows.length;
+    // LF ending this record's first line (n when the rest has no LF).
+    const lf0 = nextLF(pos);
+    let lineEnd = lf0 === -1 ? n : lf0;
+    const fields = [];
+    let firstQuoted = false;
+    let f = 0;
+    for (;;) {
+      let val;
+      if (text.charCodeAt(pos) === 34) {
+        val = scanQuoted(pos, startLine, rowIdx, lineEnd);
+        if (f === 0) firstQuoted = true;
+        if (fieldCrossed) lineEnd = -1;
+      } else {
+        val = scanBare(pos, startLine, rowIdx, lineEnd);
       }
+      fields.push(val);
+      f++;
+      if (scanEnded === 1) break;
     }
-    // General path.
-    const g = parseGeneral(pos, startLine);
-    pos = g[2];
-    finishRecord(g[0], g[1], startLine);
+    finishRecord(fields, firstQuoted, startLine);
   }
 
+  if (header && columns === null) columns = [];
   return { columns, rows, errors };
 }
